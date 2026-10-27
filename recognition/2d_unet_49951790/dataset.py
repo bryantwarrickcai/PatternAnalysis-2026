@@ -158,9 +158,74 @@ def pair_all_splits(data_root: Path | str) -> dict[str, list[PairedSlice]]:
     return {split: pair_split(data_root, split) for split in SPLITS}
 
 
+def patients_in_split(data_root: Path | str, split: str) -> set[str]:
+    """Return the unique patient IDs (``ABC``) present in a single split."""
+    return {pair.key.patient for pair in pair_split(data_root, split)}
+
+
+@dataclass(frozen=True)
+class SplitAudit:
+    """Result of a patient-level split audit."""
+
+    patient_ids: dict[str, set[str]]  # split -> patient IDs
+    pair_counts: dict[str, int]       # split -> number of paired slices
+    overlaps: dict[str, set[str]]     # "train∩validate" -> leaked patient IDs
+
+    @property
+    def is_clean(self) -> bool:
+        """True iff no patient ID appears in more than one split."""
+        return all(len(ids) == 0 for ids in self.overlaps.values())
+
+
+def audit_patient_splits(data_root: Path | str) -> SplitAudit:
+    """
+    Check for patient-level leakage across train/validate/test.
+
+    A slice split is *clean* when no patient ID (``ABC``) appears in more
+    than one split. Because a patient can contribute multiple weeks and
+    many slices, any overlap here would inflate validation/test Dice
+    relative to true held-out performance.
+
+    Returns a :class:`SplitAudit`; does not raise on overlap. Use
+    :func:`assert_no_patient_overlap` when leakage should be fatal
+    (e.g. at the start of a training run).
+    """
+    ids = {split: patients_in_split(data_root, split) for split in SPLITS}
+    pair_counts = {split: len(pair_split(data_root, split)) for split in SPLITS}
+    overlaps = {
+        "train∩validate": ids["train"] & ids["validate"],
+        "train∩test": ids["train"] & ids["test"],
+        "validate∩test": ids["validate"] & ids["test"],
+    }
+    return SplitAudit(
+        patient_ids=ids, pair_counts=pair_counts, overlaps=overlaps
+    )
+
+
+def assert_no_patient_overlap(data_root: Path | str) -> SplitAudit:
+    """
+    Raise ``RuntimeError`` if any patient ID appears in more than one split.
+
+    Intended as a startup guard in training scripts so leakage is
+    impossible by construction.
+    """
+    audit = audit_patient_splits(data_root)
+    if not audit.is_clean:
+        details = "; ".join(
+            f"{name}: {sorted(ids)}"
+            for name, ids in audit.overlaps.items()
+            if ids
+        )
+        raise RuntimeError(f"Patient-level leakage detected ({details})")
+    return audit
+
+
 def _main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inspect paired HipMRI 2D slices per split."
+        description=(
+            "Inspect HipMRI 2D slices: image/mask pairing and optional "
+            "patient-level split audit."
+        )
     )
     parser.add_argument(
         "--data-root",
@@ -168,6 +233,11 @@ def _main() -> None:
         default=Path("HipMRI_Study_open/keras_slices_data"),
         help="Folder containing keras_slices_* subfolders. Default assumes "
         "the script is run from recognition/2d_unet_49951790/.",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run a patient-level leakage audit across train/validate/test.",
     )
     args = parser.parse_args()
 
@@ -178,6 +248,29 @@ def _main() -> None:
         if pairs:
             print(f"  first: {pairs[0].key}")
             print(f"  last : {pairs[-1].key}")
+
+    if not args.audit:
+        return
+
+    print()
+    audit = audit_patient_splits(args.data_root)
+    print("Patient-level split audit:")
+    for split in SPLITS:
+        ids = sorted(audit.patient_ids[split])
+        print(
+            f"  {split:9s}  {audit.pair_counts[split]:5d} pairs  "
+            f"{len(ids):3d} patients  IDs={ids}"
+        )
+    print()
+
+    if audit.is_clean:
+        print("Result: CLEAN - no patient ID appears in more than one split.")
+    else:
+        print("Result: LEAKAGE DETECTED")
+        for name, ids in audit.overlaps.items():
+            if ids:
+                print(f"  {name}: {sorted(ids)}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

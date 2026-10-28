@@ -24,6 +24,8 @@ import argparse
 import re
 import nibabel as nib
 import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -325,6 +327,179 @@ def preprocess_pair(
 
 
 # ---------------------------------------------------------------------------
+# Augmentation (pure NumPy; keeps dataset.py dependency-light)
+# ---------------------------------------------------------------------------
+def augment_pair(
+    image: np.ndarray,
+    mask_int: np.ndarray,
+    hflip_p: float = 0.5,
+    intensity_scale: float = 0.1,
+    intensity_bias: float = 0.1,
+    noise_std: float = 0.02,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Train-only augmentation for CORONAL HipMRI slices.
+
+    Only anatomically valid transforms are applied:
+
+    - Left-right horizontal flip (pelvis is approximately bilaterally
+      symmetric, so this preserves anatomy).
+    - Per-slice intensity jitter: random scale, bias, and additive
+      Gaussian noise (does not touch spatial structure).
+
+    Deliberately NOT included (would be anatomically incorrect):
+
+    - Vertical (superior-inferior) flip: would place the bladder below
+      the rectum, an impossible pelvis geometry.
+    - Rotation beyond a few degrees: would tilt the whole body off the
+      scanner axis.
+    - Random crop / zoom: would change apparent organ scale.
+
+    See Liu et al., arXiv:2011.13615 (2020), Sec. III.D, for the
+    coronal-plane nature of this dataset.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Horizontal flip: image and mask together
+    if rng.random() < hflip_p:
+        image = np.ascontiguousarray(image[:, ::-1])
+        mask_int = np.ascontiguousarray(mask_int[:, ::-1])
+
+    # Intensity jitter (image only)
+    if intensity_scale > 0:
+        scale = 1.0 + rng.uniform(-intensity_scale, intensity_scale)
+        image = image * scale
+    if intensity_bias > 0:
+        bias = rng.uniform(-intensity_bias, intensity_bias)
+        image = image + bias
+    if noise_std > 0:
+        noise = rng.normal(0.0, noise_std, size=image.shape).astype(np.float32)
+        image = image + noise
+
+    return image.astype(np.float32, copy=False), mask_int.astype(np.int64, copy=False)
+
+
+# ---------------------------------------------------------------------------
+# PyTorch Dataset
+# ---------------------------------------------------------------------------
+class HipMRI2DDataset(Dataset):
+    """
+    In-memory PyTorch Dataset over one HipMRI split.
+
+    Each item is a dict with:
+      image       : (1, H, W)  float32  normalized image
+      mask_onehot : (C, H, W)  float32  one-hot segmentation mask
+      mask_int    : (H, W)     int64    class indices (for cross-entropy loss)
+      prostate    : (1, H, W)  float32  binary prostate mask
+      key         : str        "<patient>_w<week>_s<slice>" for provenance
+
+    Augmentation is only enabled when ``augment=True`` and should only be
+    set on the training split. See :func:`augment_pair` for which
+    transforms are considered anatomically safe.
+    """
+
+    def __init__(
+        self,
+        data_root: Path | str,
+        split: str,
+        augment: bool = False,
+        norm_method: str = "zscore",
+        num_classes: int = NUM_CLASSES,
+        prostate_label: int = PROSTATE_LABEL,
+    ) -> None:
+        self.pairs = pair_split(data_root, split)
+        self.split = split
+        self.augment = augment
+        self.norm_method = norm_method
+        self.num_classes = num_classes
+        self.prostate_label = prostate_label
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def _augment_rng(self) -> np.random.Generator:
+        # Derive a per-call seed from PyTorch's global RNG so DataLoader
+        # workers stay uncorrelated without manual worker_init_fn plumbing.
+        seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+        return np.random.default_rng(seed)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
+        pair = self.pairs[idx]
+        out = preprocess_pair(
+            pair,
+            num_classes=self.num_classes,
+            prostate_label=self.prostate_label,
+            norm_method=self.norm_method,
+        )
+        image = out["image"]
+        mask_int = out["mask_int"]
+
+        if self.augment:
+            image, mask_int = augment_pair(image, mask_int, rng=self._augment_rng())
+
+        # Recompute mask derived fields AFTER augmentation (flip changes
+        # pixel positions, so re-derive one-hot and prostate from mask_int).
+        mask_onehot = one_hot_encode(mask_int, num_classes=self.num_classes)
+        prostate = prostate_binary(mask_int, prostate_label=self.prostate_label)
+
+        return {
+            "image": torch.from_numpy(image).unsqueeze(0).float(),          # (1, H, W)
+            "mask_onehot": torch.from_numpy(mask_onehot).permute(2, 0, 1).float(),  # (C, H, W)
+            "mask_int": torch.from_numpy(mask_int).long(),                   # (H, W)
+            "prostate": torch.from_numpy(prostate).unsqueeze(0).float(),     # (1, H, W)
+            "key": str(pair.key),
+        }
+
+
+# ---------------------------------------------------------------------------
+# DataLoader factory
+# ---------------------------------------------------------------------------
+def _seed_everything(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed % (2**32))
+
+
+def get_dataloaders(
+    data_root: Path | str,
+    batch_size: int = 8,
+    num_workers: int = 0,
+    train_augment: bool = True,
+    norm_method: str = "zscore",
+    seed: int | None = None,
+    pin_memory: bool = False,
+) -> dict[str, DataLoader]:
+    """
+    Build one DataLoader per split. Train loader shuffles and augments;
+    validation and test loaders are deterministic.
+
+    ``seed`` (optional) seeds both torch and numpy for reproducibility.
+    DataLoader worker RNG is handled inside the Dataset.
+    """
+    if seed is not None:
+        _seed_everything(seed)
+
+    loaders: dict[str, DataLoader] = {}
+    for split in SPLITS:
+        dataset = HipMRI2DDataset(
+            data_root,
+            split,
+            augment=(train_augment and split == "train"),
+            norm_method=norm_method,
+        )
+        loaders[split] = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=(split == "train"),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=False,
+        )
+    return loaders
+
+
+# ---------------------------------------------------------------------------
 # Label discovery (used to verify LABEL_NAMES against real data)
 # ---------------------------------------------------------------------------
 def discover_labels(
@@ -444,6 +619,28 @@ def _main() -> None:
         action="store_true",
         help="Load one training pair end-to-end and print diagnostics.",
     )
+    parser.add_argument(
+        "--loader-check",
+        action="store_true",
+        help="Build DataLoaders, fetch one mini-batch per split, print shapes.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4,
+        help="Batch size used by --loader-check.",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=0,
+        help="DataLoader num_workers (use 0 on Rangpur for stability first).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Reproducibility seed for --loader-check.",
+    )
+    parser.add_argument(
+        "--no-train-augment",
+        action="store_true",
+        help="Disable training augmentation in --loader-check.",
+    )
     args = parser.parse_args()
 
     # --- Pairing summary (always shown) ------------------------------------
@@ -522,6 +719,29 @@ def _main() -> None:
             f"  prostate     : shape={out['prostate'].shape}, "
             f"positive fraction={float(out['prostate'].mean()):.6f}"
         )
+
+    # --- DataLoader smoke test ---------------------------------------------
+    if args.loader_check:
+        loaders = get_dataloaders(
+            args.data_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            train_augment=not args.no_train_augment,
+            seed=args.seed,
+        )
+        print(f"\nDataLoader check (batch_size={args.batch_size}, "
+              f"num_workers={args.num_workers}, seed={args.seed}):")
+        for split, loader in loaders.items():
+            batch = next(iter(loader))
+            print(
+                f"  {split:9s}  n_batches={len(loader):4d}  "
+                f"image={tuple(batch['image'].shape)}  "
+                f"mask_onehot={tuple(batch['mask_onehot'].shape)}  "
+                f"mask_int={tuple(batch['mask_int'].shape)}  "
+                f"prostate={tuple(batch['prostate'].shape)}  "
+                f"prostate_frac={batch['prostate'].mean().item():.5f}"
+            )
+            print(f"            sample keys: {list(batch['key'])[:3]}")
 
 
 if __name__ == "__main__":

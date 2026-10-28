@@ -98,3 +98,72 @@ class Up(nn.Module):
             )
         x = torch.cat([x, skip], dim=1)
         return self.conv(x)
+
+
+class UNet(nn.Module):
+    """
+    Standard 2D U-Net for semantic segmentation.
+
+    Layout (four encoder levels plus a bottleneck):
+        inc        DoubleConv(in_ch        -> base,     H,     W)
+        down1      Down(base               -> 2*base)    H/2,   W/2
+        down2      Down(2*base             -> 4*base)    H/4,   W/4
+        down3      Down(4*base             -> 8*base)    H/8,   W/8
+        down4      Down(8*base             -> 16*base)   H/16,  W/16   <- bottleneck
+        up1        Up(16*base, 8*base      -> 8*base)    H/8,   W/8
+        up2        Up( 8*base, 4*base      -> 4*base)    H/4,   W/4
+        up3        Up( 4*base, 2*base      -> 2*base)    H/2,   W/2
+        up4        Up( 2*base, 1*base      -> 1*base)    H,     W
+        outc       1x1 Conv(base -> out_ch)                H,     W   <- logits
+
+    The final 1x1 conv returns **raw logits** — no softmax/sigmoid. The
+    loss function in train.py combines softmax cross-entropy with a
+    Dice term, so applying softmax here would double-apply the
+    nonlinearity. The ``predict.py`` script applies ``argmax`` over
+    channels to obtain a per-pixel class map.
+
+    H and W should each be divisible by 16 so that four downsamples are
+    exact and no spatial rounding occurs before the upsampling path.
+    The real HipMRI slices are 256x128, both divisible by 16.
+
+    Parameters
+    ----------
+    in_channels   : number of input channels (1 for grayscale MRI slices).
+    out_channels  : number of output classes (6 for HipMRI).
+    base_features : channel width at the first level (default 32).
+                    Peak U-Net width is ``16 * base_features`` (512 here).
+    dropout       : spatial dropout applied inside every DoubleConv
+                    (0.0 = off).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        out_channels: int = 6,
+        base_features: int = 32,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        b = base_features
+        self.inc = DoubleConv(in_channels, b, dropout=dropout)
+        self.down1 = Down(b, b * 2)
+        self.down2 = Down(b * 2, b * 4)
+        self.down3 = Down(b * 4, b * 8)
+        self.down4 = Down(b * 8, b * 16)
+        self.up1 = Up(b * 16, b * 8, b * 8)
+        self.up2 = Up(b * 8, b * 4, b * 4)
+        self.up3 = Up(b * 4, b * 2, b * 2)
+        self.up4 = Up(b * 2, b, b)
+        self.outc = nn.Conv2d(b, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1 = self.inc(x)             # (N, base,     H,    W)
+        x2 = self.down1(x1)          # (N, 2*base,   H/2,  W/2)
+        x3 = self.down2(x2)          # (N, 4*base,   H/4,  W/4)
+        x4 = self.down3(x3)          # (N, 8*base,   H/8,  W/8)
+        x5 = self.down4(x4)          # (N, 16*base,  H/16, W/16)  bottleneck
+        x = self.up1(x5, x4)         # (N, 8*base,   H/8,  W/8)
+        x = self.up2(x,  x3)         # (N, 4*base,   H/4,  W/4)
+        x = self.up3(x,  x2)         # (N, 2*base,   H/2,  W/2)
+        x = self.up4(x,  x1)         # (N, base,     H,    W)
+        return self.outc(x)          # (N, out_ch,   H,    W)

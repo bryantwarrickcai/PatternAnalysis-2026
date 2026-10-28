@@ -35,6 +35,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
+from baseline import build_baseline
 from dataset import (
     NUM_CLASSES,
     PROSTATE_LABEL,
@@ -123,7 +124,13 @@ def build_loss(args: argparse.Namespace, device: torch.device) -> CombinedLoss:
 # ---------------------------------------------------------------------------
 # Model, optimizer, scheduler builders
 # ---------------------------------------------------------------------------
-def build_model(args: argparse.Namespace) -> UNet:
+def build_model(args: argparse.Namespace) -> nn.Module:
+    if getattr(args, "model", "unet") == "baseline":
+        return build_baseline(
+            in_channels=1,
+            out_channels=NUM_CLASSES,
+            base_features=args.base_features,
+        )
     return UNet(
         in_channels=1,
         out_channels=NUM_CLASSES,
@@ -526,6 +533,7 @@ def fit(
                     "optimizer_state": optimizer.state_dict(),
                     "val_metrics": val_m,
                     "args": _args_to_jsonable(args),
+                    "model_type": args.model,
                 },
                 out_dir / "best_model.pt",
             )
@@ -621,6 +629,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-plot", action="store_true",
         help="Skip rendering training curves at the end of fit().",
     )
+    p.add_argument(
+        "--model", choices=("unet", "baseline"), default="unet",
+        help="Model architecture: 'unet' (default) or 'baseline'."
+    )
     return p.parse_args(argv)
 
 
@@ -663,8 +675,11 @@ def main(argv: list[str] | None = None) -> int:
 
     model = build_model(args).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: UNet(base={args.base_features}, dropout={args.dropout}) "
-          f"| {n_params:,} params")
+    if args.model == "baseline":
+        print(f"Model: BaselineCNN(base={args.base_features}) | {n_params:,} params")
+    else:
+        print(f"Model: UNet(base={args.base_features}, dropout={args.dropout}) "
+              f"| {n_params:,} params")
 
     loss_fn = build_loss(args, device)
     optimizer = build_optimizer(model, args)

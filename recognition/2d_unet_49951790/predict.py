@@ -22,6 +22,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+from baseline import build_baseline
 from dataset import (
     NUM_CLASSES,
     PROSTATE_LABEL,
@@ -61,17 +62,26 @@ def load_checkpoint(
     return ckpt["model_state"], ckpt.get("args", {})
 
 
-def build_model_from_checkpoint(
-    ckpt: dict, device: torch.device
-) -> UNet:
-    """Instantiate ``UNet`` with the same architecture used during training."""
+def build_model_from_checkpoint(ckpt: dict, device: torch.device) -> torch.nn.Module:
+    """Instantiate the correct model architecture from the checkpoint."""
     saved_args = ckpt.get("args", {})
-    model = UNet(
-        in_channels=1,
-        out_channels=NUM_CLASSES,
-        base_features=int(saved_args.get("base_features", 32)),
-        dropout=float(saved_args.get("dropout", 0.0)),
-    ).to(device)
+    model_type = ckpt.get("model_type", saved_args.get("model", "unet"))
+    base = int(saved_args.get("base_features", 32))
+    
+    if model_type == "baseline":
+        model = build_baseline(
+            in_channels=1,
+            out_channels=NUM_CLASSES,
+            base_features=base,
+        ).to(device)
+    else:
+        model = UNet(
+            in_channels=1,
+            out_channels=NUM_CLASSES,
+            base_features=base,
+            dropout=float(saved_args.get("dropout", 0.0)),
+        ).to(device)
+        
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     return model
@@ -352,20 +362,13 @@ def main(argv: list[str] | None = None) -> int:
     print()
 
     # --- Model ---
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False) \
-        if False else None  # placeholder; we use load_checkpoint below
-    model_state, saved_args = load_checkpoint(args.checkpoint, device)
-    model = UNet(
-        in_channels=1,
-        out_channels=NUM_CLASSES,
-        base_features=int(saved_args.get("base_features", 32)),
-        dropout=float(saved_args.get("dropout", 0.0)),
-    ).to(device)
-    model.load_state_dict(model_state)
-    model.eval()
-
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    model = build_model_from_checkpoint(ckpt, device)
+    
+    saved_args = ckpt.get("args", {})
+    model_type = ckpt.get("model_type", saved_args.get("model", "unet"))
     n_params = sum(p.numel() for p in model.parameters())
-    print(f" Model      : UNet(base={saved_args.get('base_features', 32)}) "
+    print(f" Model      : {model_type.upper()} (base={saved_args.get('base_features', 32)}) "
           f"| {n_params:,} params")
 
     # --- Data ---

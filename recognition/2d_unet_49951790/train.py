@@ -345,6 +345,131 @@ def _args_to_jsonable(args: argparse.Namespace) -> dict:
     return out
 
 
+def plot_history(
+    history: dict,
+    out_dir: Path | str,
+    best_epoch: int | None = None,
+) -> list[Path]:
+    """
+    Render training curves as PNGs.
+
+    Files written
+    -------------
+    - ``loss_curve.png``   : train vs. validate loss, with best-epoch marker
+    - ``dice_curves.png``  : three panels (macro-present, prostate-present,
+                             prostate-all), each train vs. validate
+    - ``lr_curve.png``     : learning-rate schedule (log y-axis)
+
+    Skips gracefully if matplotlib is not installed — training still
+    works; only the plots are lost.
+
+    Parameters
+    ----------
+    history     : dict with keys "train", "validate", "lr" (per-epoch lists).
+    out_dir     : destination folder (created if missing).
+    best_epoch  : optional 1-based epoch number to mark with a dashed line.
+                  If None, derived from validate["dice_prostate_present"].
+
+    Returns the list of PNG paths actually written (empty if matplotlib
+    is unavailable).
+    """
+    try:
+        import matplotlib
+        # Force a non-interactive backend so savefig works headless
+        # (Rangpur HPC, CI). If matplotlib was already imported, force=True
+        # safely reconfigures. We never call plt.show(), so Agg is enough.
+        try:
+            matplotlib.use("Agg", force=True)
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "  [plot] matplotlib not installed — skipping curve plots. "
+            "Install with: pip install matplotlib"
+        )
+        return []
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    train = history["train"]
+    val = history["validate"]
+    epochs = list(range(1, len(train) + 1))
+    lr = history.get("lr", [])
+
+    if best_epoch is None and val:
+        prost_series = [m["dice_prostate_present"] for m in val]
+        best_epoch = int(
+            max(range(len(prost_series)), key=lambda i: prost_series[i])
+        ) + 1
+
+    written: list[Path] = []
+
+    # --- Loss ---
+    fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150)
+    ax.plot(epochs, [m["loss"] for m in train], marker="o", label="train")
+    ax.plot(epochs, [m["loss"] for m in val], marker="s", label="validate")
+    if best_epoch is not None:
+        ax.axvline(
+            best_epoch, color="green", linestyle="--", alpha=0.6,
+            label=f"best epoch ({best_epoch})",
+        )
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title("Combined loss (0.5 · Dice + 0.5 · CE)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    p = out_dir / "loss_curve.png"
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    written.append(p)
+
+    # --- Dice (3 panels) ---
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=150)
+    panels = [
+        ("dice_macro_present",   "macro Dice\n(present classes)"),
+        ("dice_prostate_present", "prostate Dice\n(present slices)"),
+        ("dice_prostate_all",    "prostate Dice\n(all slices)"),
+    ]
+    for ax, (key, title) in zip(axes, panels):
+        ax.plot(epochs, [m[key] for m in train], marker="o", label="train")
+        ax.plot(epochs, [m[key] for m in val], marker="s", label="validate")
+        if best_epoch is not None:
+            ax.axvline(
+                best_epoch, color="green", linestyle="--", alpha=0.6,
+            )
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("Dice")
+        ax.set_title(title)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    p = out_dir / "dice_curves.png"
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    written.append(p)
+
+    # --- LR (optional) ---
+    if lr:
+        fig, ax = plt.subplots(figsize=(7, 3.5), dpi=150)
+        ax.plot(epochs, lr, marker="o")
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("learning rate")
+        ax.set_title("Learning-rate schedule")
+        ax.set_yscale("log")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        p = out_dir / "lr_curve.png"
+        fig.savefig(p, bbox_inches="tight")
+        plt.close(fig)
+        written.append(p)
+
+    return written
+
+
 # ---------------------------------------------------------------------------
 # Full training loop
 # ---------------------------------------------------------------------------
@@ -418,14 +543,24 @@ def fit(
             f"lr={current_lr:.2e}{marker}"
         )
 
-    with open(out_dir / "history.json", "w") as f:
+    history_path = out_dir / "history.json"
+    with open(history_path, "w") as f:
         json.dump(history, f, indent=2, default=str)
+
+    plot_paths: list[Path] = []
+    if not getattr(args, "no_plot", False):
+        print()
+        print("Rendering training curves...")
+        plot_paths = plot_history(history, out_dir, best_epoch=best_epoch)
+        for p in plot_paths:
+            print(f"  wrote {p}")
 
     return {
         "best_prostate_dice": best_prostate_dice,
         "best_epoch": best_epoch,
-        "history_path": str(out_dir / "history.json"),
+        "history_path": str(history_path),
         "checkpoint_path": str(out_dir / "best_model.pt"),
+        "plot_paths": [str(p) for p in plot_paths],
     }
 
 
@@ -482,6 +617,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     p.add_argument("--out-dir", type=Path, default=Path("runs"))
+    p.add_argument(
+        "--no-plot", action="store_true",
+        help="Skip rendering training curves at the end of fit().",
+    )
     return p.parse_args(argv)
 
 

@@ -3,36 +3,47 @@ train.py
 ========
 Training and validation entrypoint for the 2D U-Net
 
-Current commit (Step 3.2) adds the training *setup* only:
-
+Contains:
 - CombinedLoss   : alpha * Dice + (1 - alpha) * CrossEntropy
-- Adam optimizer : configurable learning rate
-- ReduceLROnPlateau : tracks validation Dice, halves LR after plateau
-- Patient-leakage startup guard from dataset.assert_no_patient_overlap
-- Full argparse CLI
-- Prints a setup summary then exits (no training loop yet)
+- train_one_epoch / validate  : metric computation per epoch
+- fit            : full training loop with best-checkpoint selection
+- CLI (parse_args + main)
 
-The training / validation loop arrives in Step 3.3.
+Metrics per epoch
+-----------------
+- loss                   : weighted combined loss
+- dice_macro             : mean Dice over all classes (batch-weighted)
+- dice_macro_present     : mean Dice over classes present in any batch
+- dice_prostate_all      : mean prostate Dice over ALL validation slices
+- dice_prostate_present  : mean prostate Dice over slices where the
+                           prostate is actually present (assignment target)
+
+Best checkpoint is selected by ``dice_prostate_present``, matching the
+spec's target metric. The full history (per epoch) is written to
+``<out_dir>/history.json`` for plotting in Step 3.4.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
 from dataset import (
     NUM_CLASSES,
+    PROSTATE_LABEL,
     SPLITS,
     assert_no_patient_overlap,
     get_dataloaders,
 )
 from modules import UNet
-from utils import dice_loss
+from utils import dice_loss, dice_score
 
 
 # ---------------------------------------------------------------------------
@@ -44,18 +55,6 @@ class CombinedLoss(nn.Module):
 
         loss = dice_weight * dice_loss(logits, mask_onehot)
              + ce_weight   * CE(logits, mask_int)
-
-    Design notes
-    ------------
-    - Both terms operate on the same ``logits`` (no activation applied
-      in the model). ``dice_loss`` internally applies softmax/sigmoid.
-    - The Dice term uses ``ignore_absent=True`` (default), so slices
-      with no prostate contribute nothing to the prostate channel —
-      critical given that many coronal HipMRI slices have no prostate.
-    - The CE term uses ``ignore_index=255`` and a defensive mapping
-      (``_safe_int_target``) that converts any out-of-range integer
-      label to that ignore value, so the loss cannot produce NaN
-      if a future data revision introduces unexpected labels.
     """
 
     def __init__(
@@ -76,12 +75,9 @@ class CombinedLoss(nn.Module):
     def _safe_int_target(
         self, mask_int: torch.Tensor, num_classes: int
     ) -> torch.Tensor:
-        """Map any out-of-range integer label to ``ignore_index``."""
         valid = (mask_int >= 0) & (mask_int < num_classes)
         return torch.where(
-            valid,
-            mask_int,
-            torch.full_like(mask_int, self.ignore_index),
+            valid, mask_int, torch.full_like(mask_int, self.ignore_index)
         )
 
     def forward(
@@ -98,7 +94,6 @@ class CombinedLoss(nn.Module):
 
 
 def build_loss(args: argparse.Namespace, device: torch.device) -> CombinedLoss:
-    """Construct :class:`CombinedLoss` from CLI arguments, with validation."""
     if args.dice_weight < 0 or args.ce_weight < 0:
         raise ValueError(
             f"loss weights must be >= 0, got "
@@ -156,6 +151,285 @@ def build_scheduler(
 
 
 # ---------------------------------------------------------------------------
+# Per-epoch metric helpers
+# ---------------------------------------------------------------------------
+def _prostate_dice_per_slice(
+    logits: torch.Tensor,
+    prostate: torch.Tensor,
+    smooth: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute Dice on the prostate channel for every slice in the batch.
+
+    Parameters
+    ----------
+    logits   : (N, C, H, W) raw logits.
+    prostate : (N, 1, H, W) binary prostate target (float 0/1).
+
+    Returns
+    -------
+    dice_values  : (N,) Dice per slice, range ~[0, 1].
+    is_present   : (N,) bool, True where the target has at least 1 prostate pixel.
+    """
+    probs = torch.softmax(logits, dim=1)[:, PROSTATE_LABEL]   # (N, H, W)
+    target = prostate.squeeze(1)                              # (N, H, W)
+    inter = (probs * target).sum(dim=(1, 2))                  # (N,)
+    union = probs.sum(dim=(1, 2)) + target.sum(dim=(1, 2))    # (N,)
+    dice = (2.0 * inter + smooth) / (union + smooth)          # (N,)
+    is_present = target.sum(dim=(1, 2)) > 0                   # (N,)
+    return dice, is_present
+
+
+def _init_metric_accumulators(num_classes: int, device: torch.device) -> dict:
+    return {
+        "loss_sum": 0.0,
+        "n_samples": 0,
+        "dice_per_class_sum": torch.zeros(num_classes, device=device),
+        "dice_macro_present_sum": 0.0,
+        "prostate_dice_parts": [],
+        "prostate_present_parts": [],
+    }
+
+
+def _finalize_metrics(
+    acc: dict, num_classes: int
+) -> dict:
+    n = max(acc["n_samples"], 1)
+    dice_per_class = (acc["dice_per_class_sum"] / n).tolist()
+    dice_macro = sum(dice_per_class) / num_classes
+    dice_macro_present = acc["dice_macro_present_sum"] / n
+
+    ps_dice = (
+        torch.cat(acc["prostate_dice_parts"])
+        if acc["prostate_dice_parts"]
+        else torch.zeros(1)
+    )
+    ps_present = (
+        torch.cat(acc["prostate_present_parts"])
+        if acc["prostate_present_parts"]
+        else torch.zeros(1, dtype=torch.bool)
+    )
+    dice_prostate_all = float(ps_dice.mean().item())
+    dice_prostate_present = (
+        float(ps_dice[ps_present].mean().item()) if ps_present.any() else 0.0
+    )
+
+    return {
+        "loss": acc["loss_sum"] / n,
+        "dice_macro": dice_macro,
+        "dice_macro_present": dice_macro_present,
+        "dice_per_class": dice_per_class,
+        "dice_prostate_all": dice_prostate_all,
+        "dice_prostate_present": dice_prostate_present,
+        "n_slices": int(acc["n_samples"]),
+        "n_prostate_present": int(ps_present.sum().item()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Train / validate
+# ---------------------------------------------------------------------------
+def train_one_epoch(
+    model: nn.Module,
+    loader,
+    loss_fn: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    epoch: int = 1,
+    epoch_total: int = 1,
+) -> dict:
+    """One full pass over the training loader. Returns metric dict."""
+    model.train()
+    acc = _init_metric_accumulators(NUM_CLASSES, device)
+    pbar = tqdm(loader, desc=f"train {epoch}/{epoch_total}", leave=False)
+
+    for batch in pbar:
+        images = batch["image"].to(device, non_blocking=True)
+        onehot = batch["mask_onehot"].to(device, non_blocking=True)
+        mask_int = batch["mask_int"].to(device, non_blocking=True)
+        prostate = batch["prostate"].to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = loss_fn(logits, onehot, mask_int)
+        loss.backward()
+        optimizer.step()
+
+        bs = images.size(0)
+        acc["loss_sum"] += loss.item() * bs
+        acc["n_samples"] += bs
+
+        with torch.no_grad():
+            d = dice_score(logits.detach(), onehot)
+            acc["dice_per_class_sum"] += (
+                torch.tensor(d["per_class"], device=device) * bs
+            )
+            acc["dice_macro_present_sum"] += d["macro_present"] * bs
+
+            ps_dice, ps_present = _prostate_dice_per_slice(
+                logits.detach(), prostate
+            )
+            acc["prostate_dice_parts"].append(ps_dice.cpu())
+            acc["prostate_present_parts"].append(ps_present.cpu())
+
+        pbar.set_postfix(
+            loss=f"{acc['loss_sum'] / acc['n_samples']:.4f}"
+        )
+
+    return _finalize_metrics(acc, NUM_CLASSES)
+
+
+def validate(
+    model: nn.Module,
+    loader,
+    loss_fn: nn.Module,
+    device: torch.device,
+    epoch: int = 1,
+    epoch_total: int = 1,
+) -> dict:
+    """Full pass over a validation/test loader with no gradients."""
+    model.eval()
+    acc = _init_metric_accumulators(NUM_CLASSES, device)
+    pbar = tqdm(loader, desc=f"val   {epoch}/{epoch_total}", leave=False)
+
+    with torch.no_grad():
+        for batch in pbar:
+            images = batch["image"].to(device, non_blocking=True)
+            onehot = batch["mask_onehot"].to(device, non_blocking=True)
+            mask_int = batch["mask_int"].to(device, non_blocking=True)
+            prostate = batch["prostate"].to(device, non_blocking=True)
+
+            logits = model(images)
+            loss = loss_fn(logits, onehot, mask_int)
+
+            bs = images.size(0)
+            acc["loss_sum"] += loss.item() * bs
+            acc["n_samples"] += bs
+
+            d = dice_score(logits, onehot)
+            acc["dice_per_class_sum"] += (
+                torch.tensor(d["per_class"], device=device) * bs
+            )
+            acc["dice_macro_present_sum"] += d["macro_present"] * bs
+
+            ps_dice, ps_present = _prostate_dice_per_slice(logits, prostate)
+            acc["prostate_dice_parts"].append(ps_dice.cpu())
+            acc["prostate_present_parts"].append(ps_present.cpu())
+
+            pbar.set_postfix(
+                loss=f"{acc['loss_sum'] / acc['n_samples']:.4f}"
+            )
+
+    return _finalize_metrics(acc, NUM_CLASSES)
+
+
+def _args_to_jsonable(args: argparse.Namespace) -> dict:
+    """
+    Convert an argparse Namespace to a JSON-safe dict of primitives.
+
+    Necessary because we store ``vars(args)`` inside the checkpoint,
+    and PyTorch 2.6 changed ``torch.load`` to default ``weights_only=True``,
+    which rejects ``pathlib.Path`` (and other non-allowlisted classes).
+    Converting Paths to strings keeps the checkpoint loadable with the
+    safe default.
+    """
+    out: dict = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            out[key] = str(value)
+        elif isinstance(value, (int, float, str, bool)) or value is None:
+            out[key] = value
+        else:
+            # Fallback for any exotic type a future flag might introduce.
+            out[key] = str(value)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Full training loop
+# ---------------------------------------------------------------------------
+def fit(
+    model: nn.Module,
+    loaders: dict,
+    loss_fn: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> dict:
+    """
+    Run the full training loop.
+
+    Saves:
+      <out_dir>/best_model.pt   whenever ``dice_prostate_present`` improves
+      <out_dir>/history.json    per-epoch metric history (for Step 3.4)
+    """
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    history: dict[str, list] = {"train": [], "validate": [], "lr": []}
+    best_prostate_dice = -1.0
+    best_epoch = -1
+
+    for epoch in range(1, args.epochs + 1):
+        train_m = train_one_epoch(
+            model, loaders["train"], loss_fn, optimizer, device,
+            epoch=epoch, epoch_total=args.epochs,
+        )
+        val_m = validate(
+            model, loaders["validate"], loss_fn, device,
+            epoch=epoch, epoch_total=args.epochs,
+        )
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        if scheduler is not None:
+            scheduler.step(val_m["dice_prostate_present"])
+
+        history["train"].append(train_m)
+        history["validate"].append(val_m)
+        history["lr"].append(current_lr)
+
+        improved = val_m["dice_prostate_present"] > best_prostate_dice
+        marker = " *" if improved else ""
+        if improved:
+            best_prostate_dice = val_m["dice_prostate_present"]
+            best_epoch = epoch
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_metrics": val_m,
+                    "args": _args_to_jsonable(args),
+                },
+                out_dir / "best_model.pt",
+            )
+
+        print(
+            f"Epoch {epoch:3d}/{args.epochs} | "
+            f"train loss={train_m['loss']:.4f} "
+            f"dice_pres={train_m['dice_macro_present']:.4f} "
+            f"prost_pres={train_m['dice_prostate_present']:.4f} "
+            f"({train_m['n_prostate_present']}/{train_m['n_slices']}) | "
+            f"val loss={val_m['loss']:.4f} "
+            f"dice_pres={val_m['dice_macro_present']:.4f} "
+            f"prost_pres={val_m['dice_prostate_present']:.4f} "
+            f"({val_m['n_prostate_present']}/{val_m['n_slices']}) | "
+            f"lr={current_lr:.2e}{marker}"
+        )
+
+    with open(out_dir / "history.json", "w") as f:
+        json.dump(history, f, indent=2, default=str)
+
+    return {
+        "best_prostate_dice": best_prostate_dice,
+        "best_epoch": best_epoch,
+        "history_path": str(out_dir / "history.json"),
+        "checkpoint_path": str(out_dir / "best_model.pt"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def resolve_device(requested: str) -> torch.device:
@@ -166,9 +440,8 @@ def resolve_device(requested: str) -> torch.device:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="2D U-Net training setup for HipMRI prostate segmentation."
+        description="2D U-Net training for HipMRI prostate segmentation."
     )
-    # Data
     p.add_argument(
         "--data-root", type=Path,
         default=Path("HipMRI_Study_open/keras_slices_data"),
@@ -179,42 +452,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-augment", action="store_true",
                    help="Disable training augmentation.")
     p.add_argument("--norm-method", choices=("zscore", "minmax"),
-                   default="zscore", help="Image normalization method.")
-    # Model
-    p.add_argument("--base-features", type=int, default=32,
-                   help="First-level channel width of the U-Net.")
-    p.add_argument("--dropout", type=float, default=0.0,
-                   help="Spatial dropout inside every DoubleConv (0 disables).")
-    # Optimization
+                   default="zscore")
+    p.add_argument("--base-features", type=int, default=32)
+    p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--dice-weight", type=float, default=0.5)
     p.add_argument("--ce-weight", type=float, default=0.5)
     p.add_argument("--ignore-index", type=int, default=255)
-    p.add_argument(
-        "--ce-class-weights", type=str, default=None,
-        help=(
-            f"Comma-separated per-class CE weights, {NUM_CLASSES} values "
-            "(e.g. '1,0.1,2,4,4,8'). Default: None (uniform)."
-        ),
-    )
-    # Scheduler
+    p.add_argument("--ce-class-weights", type=str, default=None)
     p.add_argument("--no-scheduler", action="store_true")
     p.add_argument("--scheduler-factor", type=float, default=0.5)
     p.add_argument("--scheduler-patience", type=int, default=5)
-    # Reproducibility & device
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    # Output
-    p.add_argument("--out-dir", type=Path, default=Path("runs"),
-                   help="Where checkpoints and curves will be written (Step 3.4).")
+    p.add_argument("--out-dir", type=Path, default=Path("runs"))
     return p.parse_args(argv)
 
 
-# ---------------------------------------------------------------------------
-# Setup entrypoint (training loop in Step 3.3)
-# ---------------------------------------------------------------------------
 def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -223,8 +479,14 @@ def _seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.epochs < 1:
+        raise SystemExit(f"--epochs must be >= 1, got {args.epochs}")
+
     _seed_everything(args.seed)
     device = resolve_device(args.device)
 
@@ -236,7 +498,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f" GPU   {torch.cuda.get_device_name(device)}")
     print()
 
-    # ---- Patient-level split audit (hard safety guard) -------------------
     print(f"Auditing patient-level splits in: {args.data_root}")
     audit = assert_no_patient_overlap(args.data_root)
     for split in SPLITS:
@@ -244,38 +505,23 @@ def main(argv: list[str] | None = None) -> int:
             f"  {split:9s}  {audit.pair_counts[split]:5d} slices  "
             f"{len(audit.patient_ids[split]):2d} patients"
         )
-    print("  -> CLEAN (no patient appears in more than one split)")
+    print("  -> CLEAN")
     print()
 
-    # ---- Model -----------------------------------------------------------
     model = build_model(args).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: UNet(in=1, out={NUM_CLASSES}, base={args.base_features}, "
-          f"dropout={args.dropout})")
-    print(f"       {n_params:,} trainable parameters")
-    print()
+    print(f"Model: UNet(base={args.base_features}, dropout={args.dropout}) "
+          f"| {n_params:,} params")
 
-    # ---- Loss / optimizer / scheduler ------------------------------------
     loss_fn = build_loss(args, device)
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args)
 
-    print(f"Loss: {args.dice_weight:.2f}*Dice + {args.ce_weight:.2f}*CE "
-          f"(ignore_index={args.ignore_index}, "
-          f"ce_class_weights={'set' if args.ce_class_weights else 'none'})")
-    print(f"Optimizer: Adam(lr={args.lr})")
-    if scheduler is not None:
-        print(
-            f"Scheduler: ReduceLROnPlateau(mode=max, factor="
-            f"{args.scheduler_factor}, patience={args.scheduler_patience})"
-        )
-    else:
-        print("Scheduler: disabled")
+    print(f"Loss: {args.dice_weight:.2f}*Dice + {args.ce_weight:.2f}*CE")
+    print(f"Optimizer: Adam(lr={args.lr}) | scheduler: "
+          f"{'off' if scheduler is None else 'plateau'}")
     print()
 
-    # ---- Data loaders ----------------------------------------------------
-    print(f"Building DataLoaders (batch_size={args.batch_size}, "
-          f"num_workers={args.num_workers}, augment={not args.no_augment})")
     loaders = get_dataloaders(
         args.data_root,
         batch_size=args.batch_size,
@@ -286,15 +532,21 @@ def main(argv: list[str] | None = None) -> int:
         pin_memory=(device.type == "cuda"),
     )
     for split, loader in loaders.items():
-        print(
-            f"  {split:9s}  {len(loader.dataset):5d} slices  "
-            f"{len(loader):4d} batches"
-        )
+        print(f"  {split:9s}  {len(loader.dataset):5d} slices  "
+              f"{len(loader):4d} batches")
     print()
 
-    print(f"Output directory (created on first checkpoint): {args.out_dir}")
+    print(f"Training for {args.epochs} epoch(s); out_dir = {args.out_dir}")
     print()
-    print("Setup complete. The training loop arrives in Step 3.3.")
+    result = fit(model, loaders, loss_fn, optimizer, scheduler, device, args)
+
+    print()
+    print("=" * 62)
+    print("Training complete")
+    print(f"  Best epoch                : {result['best_epoch']}")
+    print(f"  Best dice_prostate_present: {result['best_prostate_dice']:.4f}")
+    print(f"  Checkpoint                : {result['checkpoint_path']}")
+    print(f"  History                   : {result['history_path']}")
     return 0
 
 

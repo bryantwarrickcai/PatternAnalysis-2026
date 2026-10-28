@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import numpy as np
 import sys
 from pathlib import Path
 
@@ -194,6 +195,100 @@ def summarize(rows: list[dict]) -> dict:
     }
 
 
+def save_overlays(
+    model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    out_dir: Path | str,
+    num_overlays: int = 20,
+) -> list[Path]:
+    """
+    Render 4-panel visualizations for up to ``num_overlays`` slices.
+
+    Panels per slice:
+      1. Input image (min-max normalized for display)
+      2. Ground truth prostate mask
+      3. Predicted prostate mask (threshold = 0.5)
+      4. Error map — White: TP, Red: FP, Blue: FN, Black: TN
+
+    Skips gracefully if matplotlib is not installed. Saved PNGs are
+    named by their slice key (``case_ABC_week_D_slice_E.png``), so the
+    filename alone tells you which case it is.
+    """
+    try:
+        import matplotlib
+        try:
+            matplotlib.use("Agg", force=True)
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  [overlay] matplotlib not installed — skipping overlays.")
+        return []
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="overlays", leave=False):
+            images = batch["image"].to(device)
+            prostate = batch["prostate"].to(device)
+            keys = batch["key"]
+
+            logits = model(images)
+            probs = torch.softmax(logits, dim=1)[:, PROSTATE_LABEL]
+            preds = (probs > 0.5).float()
+
+            for i in range(images.size(0)):
+                if len(saved) >= num_overlays:
+                    return saved
+
+                img = images[i].squeeze(0).cpu().numpy()
+                img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                target = prostate[i].squeeze(0).cpu().numpy()
+                pred = preds[i].cpu().numpy()
+                key = str(keys[i])
+
+                tp = (pred == 1) & (target == 1)
+                fp = (pred == 1) & (target == 0)
+                fn = (pred == 0) & (target == 1)
+                tn = (pred == 0) & (target == 0)
+
+                err = np.zeros((*target.shape, 3), dtype=np.float32)
+                err[tp] = [1.0, 1.0, 1.0]  # White
+                err[fp] = [1.0, 0.0, 0.0]  # Red
+                err[fn] = [0.0, 0.0, 1.0]  # Blue
+                err[tn] = [0.0, 0.0, 0.0]  # Black
+
+                fig, axes = plt.subplots(1, 4, figsize=(16, 4), dpi=150)
+
+                axes[0].imshow(img, cmap="gray")
+                axes[0].set_title(f"{key}\nInput Image")
+                axes[0].axis("off")
+
+                axes[1].imshow(target, cmap="gray")
+                axes[1].set_title("Ground Truth (Prostate)")
+                axes[1].axis("off")
+
+                axes[2].imshow(pred, cmap="gray")
+                axes[2].set_title("Prediction (Prostate)")
+                axes[2].axis("off")
+
+                axes[3].imshow(err)
+                axes[3].set_title("Error Map\n(White=TP, Red=FP, Blue=FN)")
+                axes[3].axis("off")
+
+                fig.tight_layout()
+                p = out_dir / f"{key}.png"
+                fig.savefig(p, bbox_inches="tight")
+                plt.close(fig)
+                saved.append(p)
+
+    return saved
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -227,6 +322,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CSV path for per-slice metrics. "
                         "Default: <checkpoint_dir>/<split>_metrics.csv")
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    p.add_argument("--save-overlays", action="store_true",
+                   help="Save 4-panel overlay images for a subset of slices.")
+    p.add_argument("--num-overlays", type=int, default=20,
+                   help="Maximum number of overlay images to generate (default: 20).")
+    p.add_argument("--overlay-dir", type=Path, default=None,
+                   help="Directory for overlay images "
+                        "(default: <checkpoint_dir>/overlays).")
     return p.parse_args(argv)
 
 
@@ -307,6 +409,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  prostate TP total      : {summary['total_tp']:,}")
     print(f"  prostate FP total      : {summary['total_fp']:,}")
     print(f"  prostate FN total      : {summary['total_fn']:,}")
+    if args.save_overlays:
+        overlay_dir = args.overlay_dir
+        if overlay_dir is None:
+            overlay_dir = args.checkpoint.parent / "overlays"
+        print(f"\nGenerating up to {args.num_overlays} overlay images in {overlay_dir}...")
+        saved = save_overlays(
+            model, loader, device, overlay_dir, num_overlays=args.num_overlays
+        )
+        print(f"  Wrote {len(saved)} overlay PNG(s).")
     return 0
 
 

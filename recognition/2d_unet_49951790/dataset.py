@@ -25,7 +25,7 @@ import re
 import nibabel as nib
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -326,6 +326,62 @@ def preprocess_pair(
     }
 
 
+def _fit_to_size(
+    image: np.ndarray,
+    mask: np.ndarray,
+    target_h: int,
+    target_w: int,
+    image_fill: float = 0.0,
+    mask_fill: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Pad (if smaller) or center-crop (if larger) image and mask together to
+    a fixed ``(target_h, target_w)``. Image and mask are transformed
+    identically so spatial alignment is preserved.
+
+    Padding values
+    --------------
+    - image: ``image_fill`` = 0.0. After ``normalize_image`` this is the
+      mean intensity in z-score space (neutral) and the minimum intensity
+      in min-max space (background / air for coronal pelvis MRI). Either
+      way, padding is safe.
+    - mask : ``mask_fill`` = 0 = background label.
+    """
+    h, w = image.shape
+    if mask.shape != (h, w):
+        raise ValueError(
+            f"image/mask shape mismatch: image {image.shape}, mask {mask.shape}"
+        )
+
+    # ---- Height ----
+    if h < target_h:
+        pad_top = (target_h - h) // 2
+        pad_bot = target_h - h - pad_top
+        image = np.pad(image, ((pad_top, pad_bot), (0, 0)),
+                       mode="constant", constant_values=image_fill)
+        mask = np.pad(mask, ((pad_top, pad_bot), (0, 0)),
+                      mode="constant", constant_values=mask_fill)
+    elif h > target_h:
+        top = (h - target_h) // 2
+        image = image[top:top + target_h, :]
+        mask = mask[top:top + target_h, :]
+
+    # ---- Width ----
+    if w < target_w:
+        pad_left = (target_w - w) // 2
+        pad_right = target_w - w - pad_left
+        image = np.pad(image, ((0, 0), (pad_left, pad_right)),
+                       mode="constant", constant_values=image_fill)
+        mask = np.pad(mask, ((0, 0), (pad_left, pad_right)),
+                      mode="constant", constant_values=mask_fill)
+    elif w > target_w:
+        left = (w - target_w) // 2
+        image = image[:, left:left + target_w]
+        mask = mask[:, left:left + target_w]
+
+    return image, mask
+
+
 # ---------------------------------------------------------------------------
 # Augmentation (pure NumPy; keeps dataset.py dependency-light)
 # ---------------------------------------------------------------------------
@@ -408,6 +464,7 @@ class HipMRI2DDataset(Dataset):
         norm_method: str = "zscore",
         num_classes: int = NUM_CLASSES,
         prostate_label: int = PROSTATE_LABEL,
+        target_size: tuple[int, int] = (256, 160),
     ) -> None:
         self.pairs = pair_split(data_root, split)
         self.split = split
@@ -415,13 +472,13 @@ class HipMRI2DDataset(Dataset):
         self.norm_method = norm_method
         self.num_classes = num_classes
         self.prostate_label = prostate_label
+        self.target_size = tuple(int(v) for v in target_size)
+        self._crop_warned = False
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     def _augment_rng(self) -> np.random.Generator:
-        # Derive a per-call seed from PyTorch's global RNG so DataLoader
-        # workers stay uncorrelated without manual worker_init_fn plumbing.
         seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         return np.random.default_rng(seed)
 
@@ -436,19 +493,36 @@ class HipMRI2DDataset(Dataset):
         image = out["image"]
         mask_int = out["mask_int"]
 
+        # Pad / center-crop to a canonical size so batches are uniform
+        src_h, src_w = image.shape
+        tgt_h, tgt_w = self.target_size
+        if (src_h, src_w) != (tgt_h, tgt_w):
+            if not self._crop_warned and (src_h > tgt_h or src_w > tgt_w):
+                import warnings
+                warnings.warn(
+                    f"Slice {pair.key} is {src_h}x{src_w}, larger than "
+                    f"target {tgt_h}x{tgt_w}. Center-cropping — bump "
+                    f"--target-size if this is unintended.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._crop_warned = True
+            image, mask_int = _fit_to_size(
+                image, mask_int, tgt_h, tgt_w,
+                image_fill=0.0, mask_fill=0,
+            )
+
         if self.augment:
             image, mask_int = augment_pair(image, mask_int, rng=self._augment_rng())
 
-        # Recompute mask derived fields AFTER augmentation (flip changes
-        # pixel positions, so re-derive one-hot and prostate from mask_int).
         mask_onehot = one_hot_encode(mask_int, num_classes=self.num_classes)
         prostate = prostate_binary(mask_int, prostate_label=self.prostate_label)
 
         return {
-            "image": torch.from_numpy(image).unsqueeze(0).float(),          # (1, H, W)
-            "mask_onehot": torch.from_numpy(mask_onehot).permute(2, 0, 1).float(),  # (C, H, W)
-            "mask_int": torch.from_numpy(mask_int).long(),                   # (H, W)
-            "prostate": torch.from_numpy(prostate).unsqueeze(0).float(),     # (1, H, W)
+            "image": torch.from_numpy(image).unsqueeze(0).float(),
+            "mask_onehot": torch.from_numpy(mask_onehot).permute(2, 0, 1).float(),
+            "mask_int": torch.from_numpy(mask_int).long(),
+            "prostate": torch.from_numpy(prostate).unsqueeze(0).float(),
             "key": str(pair.key),
         }
 
@@ -469,13 +543,22 @@ def get_dataloaders(
     norm_method: str = "zscore",
     seed: int | None = None,
     pin_memory: bool = False,
+    target_size: tuple[int, int] = (256, 160),
+    limit_train: int | None = None,
+    limit_val: int | None = None,
 ) -> dict[str, DataLoader]:
     """
-    Build one DataLoader per split. Train loader shuffles and augments;
-    validation and test loaders are deterministic.
+    Build one DataLoader per split.
 
-    ``seed`` (optional) seeds both torch and numpy for reproducibility.
-    DataLoader worker RNG is handled inside the Dataset.
+    All slices are padded/center-cropped to ``target_size`` so batches
+    are collatable and the U-Net sees uniform shapes. Default 256x160
+    covers the widest slices in ``keras_slices_data`` (256x128 and
+    256x144 in our audit); pass a larger tuple if your copy has wider
+    slices.
+
+    ``limit_train`` / ``limit_val`` truncate the split to the first N
+    samples (useful for fast smoke tests on CPU). ``test`` is never
+    truncated.
     """
     if seed is not None:
         _seed_everything(seed)
@@ -487,7 +570,12 @@ def get_dataloaders(
             split,
             augment=(train_augment and split == "train"),
             norm_method=norm_method,
+            target_size=target_size,
         )
+        if split == "train" and limit_train is not None:
+            dataset = Subset(dataset, range(min(int(limit_train), len(dataset))))
+        elif split == "validate" and limit_val is not None:
+            dataset = Subset(dataset, range(min(int(limit_val), len(dataset))))
         loaders[split] = DataLoader(
             dataset,
             batch_size=batch_size,

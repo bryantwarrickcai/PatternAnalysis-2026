@@ -453,6 +453,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Disable training augmentation.")
     p.add_argument("--norm-method", choices=("zscore", "minmax"),
                    default="zscore")
+    p.add_argument(
+        "--target-size", type=int, nargs=2, default=[256, 160],
+        metavar=("H", "W"),
+        help="Pad/crop all slices to this size before batching. "
+             "Both values should be divisible by 16 for a clean U-Net.",
+    )
+    p.add_argument(
+        "--limit-train", type=int, default=None,
+        help="Use only the first N training slices (fast smoke test).",
+    )
+    p.add_argument(
+        "--limit-val", type=int, default=None,
+        help="Use only the first N validation slices (fast smoke test).",
+    )
     p.add_argument("--base-features", type=int, default=32)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=50)
@@ -530,6 +544,9 @@ def main(argv: list[str] | None = None) -> int:
         norm_method=args.norm_method,
         seed=args.seed,
         pin_memory=(device.type == "cuda"),
+        target_size=tuple(args.target_size),
+        limit_train=args.limit_train,
+        limit_val=args.limit_val,
     )
     for split, loader in loaders.items():
         print(f"  {split:9s}  {len(loader.dataset):5d} slices  "

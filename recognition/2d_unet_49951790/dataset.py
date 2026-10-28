@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import nibabel as nib
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -37,6 +39,42 @@ _CASE_RE = re.compile(
 _SEG_RE = re.compile(
     r"^seg_(?P<patient>\d{3})_week_(?P<week>\d+)_slice_(?P<slice>\d+)\.nii\.gz$"
 )
+
+# ---------------------------------------------------------------------------
+# Label scheme
+# ---------------------------------------------------------------------------
+# Verified against:
+#   - HipMRI data use agreement (HipMRI_Study_open/data_use_agreement.txt):
+#       "The body outline, bone, bladder, rectum, and prostate regions
+#        are segmented in 3D by an MR physicist ..."
+#   - Reference paper for this dataset (MRI image synthesis track):
+#       Liu et al., "Manipulating Medical Image Translation with Manifold
+#       Disentanglement", arXiv:2011.13615, 2020, Sec. III.D:
+#         "Each 3D image is 256x256x128 in resolution and is manually
+#          labelled with five foreground classes: body, bone, bladder,
+#          rectum and prostate."
+#   - Empirical label discovery on keras_slices_seg_train
+#     (`python dataset.py --discover-labels`), which produced pixel
+#     distributions consistent with the reference (body ~68%, bone ~12%,
+#     bladder ~2%, rectum ~0.4%, prostate ~0.4%).
+# Nifti headers do NOT store label names (descrip/aux_file/intent_name
+# are empty, intent_code = 1002 "label map"). Any labels displayed by a
+# web viewer are therefore heuristic guesses, not file content.
+#
+# Note: the dataset is a **coronal** acquisition (see paper, Sec. III.D:
+# "256x128 images from the centre 40 slices of the coronal plane").
+# This restricts valid augmentation: left-right flip is anatomically
+# safe; superior-inferior flip is NOT.
+LABEL_NAMES: dict[int, str] = {
+    0: "background",
+    1: "body",
+    2: "bone",
+    3: "bladder",
+    4: "rectum",
+    5: "prostate",
+}
+NUM_CLASSES: int = len(LABEL_NAMES)
+PROSTATE_LABEL: int = 5  # required by Project 2.2 (Dice >= 0.75 target)
 
 
 @dataclass(frozen=True, order=True)
@@ -163,6 +201,157 @@ def patients_in_split(data_root: Path | str, split: str) -> set[str]:
     return {pair.key.patient for pair in pair_split(data_root, split)}
 
 
+# ---------------------------------------------------------------------------
+# Nifti loading
+# ---------------------------------------------------------------------------
+def _load_nifti_array(path: Path) -> np.ndarray:
+    """
+    Load a Nifti file as a 2D numpy array.
+
+    The 2D slices in ``keras_slices_data`` are single-slice volumes.
+    We squeeze any trivial (size-1) trailing axes that nibabel exposes,
+    then require a 2D array. Affine is not returned because we operate
+    on 2D slices directly; downstream tasks don't need world coordinates.
+    """
+    img = nib.load(str(path))
+    data = np.asanyarray(img.dataobj)  # preserves integer dtype for labels
+    data = np.squeeze(data)
+    if data.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D slice, got shape {data.shape} for {path.name}"
+        )
+    return data
+
+
+def load_image_slice(path: Path) -> np.ndarray:
+    """Load an image slice as a 2D float32 array (no normalization)."""
+    return _load_nifti_array(path).astype(np.float32, copy=False)
+
+
+def load_mask_slice(path: Path) -> np.ndarray:
+    """
+    Load a label slice as a 2D int64 array.
+
+    HipMRI masks can be stored as float Nifti; we round to the nearest
+    integer so label values are exact (e.g. 5.0 -> 5). Integer-stored
+    masks pass through unchanged.
+    """
+    raw = _load_nifti_array(path)
+    if np.issubdtype(raw.dtype, np.floating):
+        raw = np.rint(raw)
+    return raw.astype(np.int64, copy=False)
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing
+# ---------------------------------------------------------------------------
+def normalize_image(image: np.ndarray, method: str = "zscore") -> np.ndarray:
+    """
+    Normalize an image to a stable input range.
+
+    zscore : (x - mean) / std, with a safe denominator.
+    minmax : (x - min) / (max - min), with a safe denominator.
+    """
+    image = image.astype(np.float32, copy=False)
+    if method == "zscore":
+        mean = float(image.mean())
+        std = float(image.std())
+        return (image - mean) / max(std, 1e-8)
+    if method == "minmax":
+        lo = float(image.min())
+        hi = float(image.max())
+        return (image - lo) / max(hi - lo, 1e-8)
+    raise ValueError(f"Unknown normalization method: {method!r}")
+
+
+def one_hot_encode(mask: np.ndarray, num_classes: int = NUM_CLASSES) -> np.ndarray:
+    """
+    Convert an (H, W) integer label map to an (H, W, C) float32 one-hot stack.
+
+    Labels outside ``[0, num_classes)`` produce all-zero vectors on every
+    channel (treated as "ignore" by the loss in train.py).
+
+    Note: not every slice contains every class. On the coronal plane,
+    the bladder (label 3) and rectum (label 4) are often absent on any
+    given slice, and the prostate (label 5) is absent on the apex/base
+    slices. This is expected data, not an error — filtering logic and
+    per-class validity handling live in train.py, not here.
+    """
+    h, w = mask.shape
+    onehot = np.zeros((h, w, num_classes), dtype=np.float32)
+    for c in range(num_classes):
+        onehot[..., c] = (mask == c).astype(np.float32)
+    return onehot
+
+
+def prostate_binary(
+    mask: np.ndarray, prostate_label: int = PROSTATE_LABEL
+) -> np.ndarray:
+    """Return a 2D binary mask (1.0 on prostate, 0.0 elsewhere), float32."""
+    return (mask == prostate_label).astype(np.float32)
+
+
+def preprocess_pair(
+    pair: PairedSlice,
+    num_classes: int = NUM_CLASSES,
+    prostate_label: int = PROSTATE_LABEL,
+    norm_method: str = "zscore",
+) -> dict[str, np.ndarray]:
+    """
+    Load and preprocess one PairedSlice.
+
+    Returns a dict with:
+      image       : (H, W)      float32  normalized image
+      mask_int    : (H, W)      int64    raw labels (for metrics / audit)
+      mask_onehot : (H, W, C)   float32  one-hot mask
+      prostate    : (H, W)      float32  binary prostate mask
+    """
+    image = load_image_slice(pair.image_path)
+    mask_int = load_mask_slice(pair.mask_path)
+    if image.shape != mask_int.shape:
+        raise ValueError(
+            f"Shape mismatch for {pair.key}: "
+            f"image {image.shape} vs mask {mask_int.shape}"
+        )
+    image = normalize_image(image, method=norm_method)
+    mask_onehot = one_hot_encode(mask_int, num_classes=num_classes)
+    prostate = prostate_binary(mask_int, prostate_label=prostate_label)
+    return {
+        "image": image,
+        "mask_int": mask_int,
+        "mask_onehot": mask_onehot,
+        "prostate": prostate,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Label discovery (used to verify LABEL_NAMES against real data)
+# ---------------------------------------------------------------------------
+def discover_labels(
+    data_root: Path | str,
+    split: str = "train",
+    num_samples: int | None = None,
+) -> dict[int, int]:
+    """
+    Scan mask files in a split and return total pixel counts per label value.
+
+    Run this before training and compare against :data:`LABEL_NAMES`.
+    Unexpected label values (e.g. ``-1`` or ``6``) will show up here.
+    """
+    pairs = pair_split(data_root, split)
+    if num_samples is not None:
+        pairs = pairs[:num_samples]
+    counts: dict[int, int] = {}
+    for pair in pairs:
+        labels, per_label = np.unique(
+            load_mask_slice(pair.mask_path), return_counts=True
+        )
+        for label, count in zip(labels.tolist(), per_label.tolist()):
+            key = int(label)
+            counts[key] = counts.get(key, 0) + int(count)
+    return counts
+
+
 @dataclass(frozen=True)
 class SplitAudit:
     """Result of a patient-level split audit."""
@@ -223,8 +412,8 @@ def assert_no_patient_overlap(data_root: Path | str) -> SplitAudit:
 def _main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Inspect HipMRI 2D slices: image/mask pairing and optional "
-            "patient-level split audit."
+            "Inspect HipMRI 2D slices: pairing, patient-level audit, "
+            "label discovery, and preprocessing smoke test."
         )
     )
     parser.add_argument(
@@ -237,10 +426,27 @@ def _main() -> None:
     parser.add_argument(
         "--audit",
         action="store_true",
-        help="Run a patient-level leakage audit across train/validate/test.",
+        help="Patient-level leakage audit across train/validate/test.",
+    )
+    parser.add_argument(
+        "--discover-labels",
+        action="store_true",
+        help="Report pixel counts per label value on the train split.",
+    )
+    parser.add_argument(
+        "--discover-samples",
+        type=int,
+        default=None,
+        help="Limit --discover-labels to the first N masks (faster).",
+    )
+    parser.add_argument(
+        "--preprocess-check",
+        action="store_true",
+        help="Load one training pair end-to-end and print diagnostics.",
     )
     args = parser.parse_args()
 
+    # --- Pairing summary (always shown) ------------------------------------
     for split in SPLITS:
         pairs = pair_split(args.data_root, split)
         patients = sorted({pair.key.patient for pair in pairs})
@@ -249,28 +455,73 @@ def _main() -> None:
             print(f"  first: {pairs[0].key}")
             print(f"  last : {pairs[-1].key}")
 
-    if not args.audit:
-        return
+    # --- Patient-level audit ----------------------------------------------
+    if args.audit:
+        print()
+        audit = audit_patient_splits(args.data_root)
+        print("Patient-level split audit:")
+        for split in SPLITS:
+            ids = sorted(audit.patient_ids[split])
+            print(
+                f"  {split:9s}  {audit.pair_counts[split]:5d} pairs  "
+                f"{len(ids):3d} patients  IDs={ids}"
+            )
+        print()
+        if audit.is_clean:
+            print("Result: CLEAN - no patient ID appears in more than one split.")
+        else:
+            print("Result: LEAKAGE DETECTED")
+            for name, ids in audit.overlaps.items():
+                if ids:
+                    print(f"  {name}: {sorted(ids)}")
+            raise SystemExit(1)
 
-    print()
-    audit = audit_patient_splits(args.data_root)
-    print("Patient-level split audit:")
-    for split in SPLITS:
-        ids = sorted(audit.patient_ids[split])
-        print(
-            f"  {split:9s}  {audit.pair_counts[split]:5d} pairs  "
-            f"{len(ids):3d} patients  IDs={ids}"
+    # --- Label discovery ---------------------------------------------------
+    if args.discover_labels:
+        print("\nLabel counts on train masks:")
+        counts = discover_labels(
+            args.data_root, split="train", num_samples=args.discover_samples
         )
-    print()
+        if not counts:
+            print("  no masks found")
+        else:
+            total = sum(counts.values())
+            for label in sorted(counts):
+                name = LABEL_NAMES.get(label, "UNKNOWN")
+                pct = 100.0 * counts[label] / total if total else 0.0
+                print(
+                    f"  label {label:3d} ({name:9s}): "
+                    f"{counts[label]:>12,d} pixels  ({pct:6.3f}%)"
+                )
+            unknown = [v for v in counts if v not in LABEL_NAMES]
+            if unknown:
+                print(
+                    f"\n  WARNING: unknown label values {unknown}. "
+                    f"Update LABEL_NAMES / NUM_CLASSES / PROSTATE_LABEL."
+                )
 
-    if audit.is_clean:
-        print("Result: CLEAN - no patient ID appears in more than one split.")
-    else:
-        print("Result: LEAKAGE DETECTED")
-        for name, ids in audit.overlaps.items():
-            if ids:
-                print(f"  {name}: {sorted(ids)}")
-        raise SystemExit(1)
+    # --- Preprocessing smoke test -----------------------------------------
+    if args.preprocess_check:
+        pairs = pair_split(args.data_root, "train")
+        if not pairs:
+            print("\nNo training pairs found.")
+            return
+        out = preprocess_pair(pairs[0])
+        print(f"\nPreprocess check ({pairs[0].key}):")
+        print(
+            f"  image        : shape={out['image'].shape}, "
+            f"dtype={out['image'].dtype}, "
+            f"min={out['image'].min():.3f}, max={out['image'].max():.3f}"
+        )
+        uniq = sorted(set(out["mask_int"].ravel().tolist()))
+        print(f"  mask_int     : shape={out['mask_int'].shape}, labels={uniq}")
+        per_class = out["mask_onehot"].sum(axis=(0, 1)).astype(int).tolist()
+        print(f"  mask_onehot  : shape={out['mask_onehot'].shape}, "
+              f"per-class pixel counts={per_class}")
+        print(
+            f"  prostate     : shape={out['prostate'].shape}, "
+            f"positive fraction={float(out['prostate'].mean()):.6f}"
+        )
 
 
 if __name__ == "__main__":

@@ -170,15 +170,8 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=out_dir,
         num_overlays=len(target_indices),
     )
-    
-    print(f" Done. Wrote {len(saved_paths)} images.")
-    print()
-    print("Next steps for your report:")
-    print("1. Open the PNGs in the output directory.")
-    print("2. Identify if the failure is at the base/apex (boundary failure),")
-    print("   or if the model is confusing rectum/bladder for prostate (FP).")
-    print("3. Reference these specific filenames in your README.")
-    
+
+    print(f" Done. Wrote {len(saved_paths)} overlay images to {out_dir}.")
     return 0
 
 
